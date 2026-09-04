@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
+import fallbackFirebaseConfig from './firebase-applet-config.json';
 
 dotenv.config();
 
@@ -12,9 +13,9 @@ let firebaseConfig: {
   apiKey: string;
   firestoreDatabaseId?: string;
 } = {
-  projectId: 'personal-gemini-journal-507109',
-  apiKey: 'AIzaSyA29RkIjkb5IlvVXkxcczk2Ll25bU92740',
-  firestoreDatabaseId: 'ai-studio-697eeba7-4692-4030-aac5-8d1022e8a45e'
+  projectId: fallbackFirebaseConfig.projectId || 'personal-gemini-journal-507109',
+  apiKey: fallbackFirebaseConfig.apiKey || 'AIzaSyA29RkIjkb5IlvVXkxcczk2Ll25bU92740',
+  firestoreDatabaseId: fallbackFirebaseConfig.firestoreDatabaseId || 'ai-studio-697eeba7-4692-4030-aac5-8d1022e8a45e'
 };
 
 try {
@@ -37,14 +38,21 @@ const PORT = 3000;
 
 // Handle potential pre-parsed body from Vercel serverless functions
 app.use((req: Request, res: Response, next) => {
-  if (req.body && typeof req.body === 'object') {
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'string') {
+      try {
+        req.body = JSON.parse(req.body);
+      } catch {
+        // Keep string if not valid JSON
+      }
+    }
     (req as any)._body = true;
   }
   next();
 });
 
 // Security: JSON body parser with size limiter to prevent DoS
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 // Security & CORS: Allow cross-origin preflights and standard headers for serverless/Vercel environments
 app.use((req: Request, res: Response, next) => {
@@ -323,7 +331,7 @@ async function fetchConversationMessages(
 }
 
 // Lazy initialization of Gemini client
-function getGeminiClient(): GoogleGenAI {
+function getGeminiClient(): { ai: GoogleGenAI; hasKey: boolean } {
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.API_KEY;
   const options: { apiKey?: string; httpOptions?: { headers?: Record<string, string> } } = {
     httpOptions: {
@@ -335,7 +343,10 @@ function getGeminiClient(): GoogleGenAI {
   if (apiKey) {
     options.apiKey = apiKey;
   }
-  return new GoogleGenAI(options);
+  return {
+    ai: new GoogleGenAI(options),
+    hasKey: Boolean(apiKey)
+  };
 }
 
 // Helper to call Gemini with retries and fallback models for handling 503/429 spikes or model latency
@@ -346,19 +357,19 @@ async function generateContentWithRetry(
     config?: any;
     primaryModel?: string;
     fallbackModels?: string[];
+    timeoutMs?: number;
   }
 ) {
   const modelsToTry = [
-    params.primaryModel || 'gemini-3.1-flash-lite',
-    ...(params.fallbackModels || ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-3.7-flash'])
+    params.primaryModel || 'gemini-3.8-flash',
+    ...(params.fallbackModels || ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'])
   ];
 
   let lastError: any = null;
+  const timeoutMs = params.timeoutMs || 8000;
 
   for (const model of modelsToTry) {
     try {
-      // 12-second timeout per model so if one model endpoint stalls, we immediately try the next
-      const timeoutMs = 12000;
       let timer: any;
       const timeoutPromise = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms waiting for ${model}`)), timeoutMs);
@@ -379,7 +390,7 @@ async function generateContentWithRetry(
       }
     } catch (err: any) {
       lastError = err;
-      const status = err?.status || (err?.message?.includes('429') ? '429 Quota' : 'Unavailable');
+      const status = err?.status || (err?.message?.includes('429') ? '429 Quota' : err?.message || 'Unavailable');
       console.warn(`[Gemini Fallback] Model ${model} (${status}). Attempting next model...`);
       continue;
     }
@@ -415,17 +426,23 @@ apiRouter.post('/chat', async (req: Request, res: Response) => {
     const auth = await authenticateFirebaseRequest(req, res);
     if (!auth) return;
 
-    const { messages, currentMessage, approvedMemories = [], userTimezone = 'UTC' } = req.body;
+    const body = req.body || {};
+    const currentMessage = typeof body.currentMessage === 'string' ? body.currentMessage : '';
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const approvedMemories = Array.isArray(body.approvedMemories) ? body.approvedMemories : [];
+    const userTimezone = typeof body.userTimezone === 'string' ? body.userTimezone : 'UTC';
 
     // Input Validation
-    if (!currentMessage || typeof currentMessage !== 'string' || !currentMessage.trim()) {
+    if (!currentMessage.trim()) {
       return res.status(400).json({ error: 'Valid currentMessage is required' });
     }
-    if (!Array.isArray(messages)) {
-      return res.status(400).json({ error: 'messages array is required' });
-    }
 
-    const ai = getGeminiClient();
+    const { ai, hasKey } = getGeminiClient();
+    if (!hasKey) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server. Please configure GEMINI_API_KEY in your environment variables.'
+      });
+    }
 
     // Format approved memories as contextual guidance
     const memoriesContext = approvedMemories.length > 0
@@ -538,8 +555,8 @@ ${memoriesContext}
     };
 
     const response = await generateContentWithRetry(ai, {
-      primaryModel: 'gemini-3.1-flash-lite',
-      fallbackModels: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-3.7-flash'],
+      primaryModel: 'gemini-3.8-flash',
+      fallbackModels: ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'],
       contents,
       config: {
         systemInstruction,
@@ -575,10 +592,21 @@ apiRouter.post('/ask-journal', async (req: Request, res: Response) => {
     const verifiedUid = auth.uid;
     const idToken = auth.idToken;
 
-    // 3. Validate user question input
-    const { question, chatHistory = [], userTimezone = 'UTC' } = req.body;
-    if (!question || typeof question !== 'string' || !question.trim()) {
+    // 3. Validate user question input safely
+    const body = req.body || {};
+    const question = typeof body.question === 'string' ? body.question : '';
+    const chatHistory = Array.isArray(body.chatHistory) ? body.chatHistory : [];
+    const userTimezone = typeof body.userTimezone === 'string' ? body.userTimezone : 'UTC';
+
+    if (!question.trim()) {
       return res.status(400).json({ error: 'A valid question is required.' });
+    }
+
+    const { ai, hasKey } = getGeminiClient();
+    if (!hasKey) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server. Please configure GEMINI_API_KEY in your environment variables.'
+      });
     }
 
     // 4. Retrieve ONLY this verified user's journal collections from Firestore
@@ -865,8 +893,6 @@ Reference Date Today: ${todayReadable} (${todayIso}) (User Timezone: ${userTimez
 
 ${contextText}`;
 
-    const ai = getGeminiClient();
-
     const contents: any[] = [];
     if (Array.isArray(chatHistory)) {
       const recentHistory = chatHistory.slice(-6);
@@ -899,8 +925,8 @@ ${contextText}`;
     };
 
     const response = await generateContentWithRetry(ai, {
-      primaryModel: 'gemini-3.1-flash-lite',
-      fallbackModels: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-3.7-flash'],
+      primaryModel: 'gemini-3.8-flash',
+      fallbackModels: ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'],
       contents,
       config: {
         systemInstruction,
@@ -946,7 +972,7 @@ ${contextText}`;
   } catch (error: any) {
     console.error('Server error in /api/ask-journal:', error?.message || error);
     return res.status(500).json({
-      error: 'An internal error occurred while processing your journal query. Please try again.'
+      error: error?.message ? `Failed to process journal query: ${error.message}` : 'An internal error occurred while processing your journal query. Please try again.'
     });
   }
 });
@@ -957,13 +983,20 @@ apiRouter.post('/summarize', async (req: Request, res: Response) => {
     const auth = await authenticateFirebaseRequest(req, res);
     if (!auth) return;
 
-    const { messages, conversationTitle } = req.body;
+    const body = req.body || {};
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const conversationTitle = typeof body.conversationTitle === 'string' ? body.conversationTitle : '';
 
-    if (!Array.isArray(messages) || messages.length === 0) {
+    if (messages.length === 0) {
       return res.status(400).json({ error: 'Conversation messages are required for summarization' });
     }
 
-    const ai = getGeminiClient();
+    const { ai, hasKey } = getGeminiClient();
+    if (!hasKey) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server. Please configure GEMINI_API_KEY in your environment variables.'
+      });
+    }
 
     const formattedTranscript = messages
       .map((m: any) => `${m.role === 'model' ? 'Journal Companion' : 'User'}: ${m.content}`)
@@ -1016,8 +1049,8 @@ Produce a structured, deeply insightful summary following the schema.`;
     };
 
     const response = await generateContentWithRetry(ai, {
-      primaryModel: 'gemini-3.1-flash-lite',
-      fallbackModels: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-3.7-flash'],
+      primaryModel: 'gemini-3.8-flash',
+      fallbackModels: ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'],
       contents: prompt,
       config: {
         systemInstruction: 'You are an insightful journal summarizer. You capture core emotional nuances, actionable takeaways, and dates with clarity and privacy-first discretion.',
@@ -1038,7 +1071,7 @@ Produce a structured, deeply insightful summary following the schema.`;
   } catch (error: any) {
     console.error('Server error in /api/summarize:', error?.message || error);
     return res.status(500).json({
-      error: 'Failed to generate journal summary. Please try again.'
+      error: error?.message || 'Failed to generate journal summary. Please try again.'
     });
   }
 });
@@ -1046,7 +1079,11 @@ Produce a structured, deeply insightful summary following the schema.`;
 // Daily Mindful Reflection Prompt Generator
 apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
   try {
-    const ai = getGeminiClient();
+    const { ai, hasKey } = getGeminiClient();
+    if (!hasKey) {
+      throw new Error('Gemini API key not configured');
+    }
+
     const prompt = 'Generate 3 unique, inspiring, and calming daily journal reflection prompts for personal growth, mindfulness, and clarity.';
     
     const promptSchema: Schema = {
@@ -1070,8 +1107,8 @@ apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
     };
 
     const response = await generateContentWithRetry(ai, {
-      primaryModel: 'gemini-3.1-flash-lite',
-      fallbackModels: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-3.7-flash'],
+      primaryModel: 'gemini-3.8-flash',
+      fallbackModels: ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'],
       contents: prompt,
       config: {
         temperature: 0.8,
@@ -1112,6 +1149,15 @@ apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
 // Mount API router under both /api and / to seamlessly support direct calls and Vercel path rewrites
 app.use('/api', apiRouter);
 app.use('/', apiRouter);
+
+// Express unhandled error handler: Always return JSON instead of default HTML error page
+app.use((err: any, req: Request, res: Response, next: any) => {
+  console.error('Unhandled Express error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({
+    error: err?.message || 'An internal server error occurred.'
+  });
+});
 
 // Start Express server and connect Vite in standalone non-serverless mode
 async function startServer() {
