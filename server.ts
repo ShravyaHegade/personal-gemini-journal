@@ -3,7 +3,6 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
 
@@ -28,11 +27,38 @@ try {
   console.warn('Note: using fallback Firebase configuration:', e);
 }
 
+// Allow environment variable overrides (e.g. on Vercel deployment)
+if (process.env.FIREBASE_PROJECT_ID) firebaseConfig.projectId = process.env.FIREBASE_PROJECT_ID;
+if (process.env.FIREBASE_API_KEY) firebaseConfig.apiKey = process.env.FIREBASE_API_KEY;
+if (process.env.FIRESTORE_DATABASE_ID) firebaseConfig.firestoreDatabaseId = process.env.FIRESTORE_DATABASE_ID;
+
 const app = express();
 const PORT = 3000;
 
+// Handle potential pre-parsed body from Vercel serverless functions
+app.use((req: Request, res: Response, next) => {
+  if (req.body && typeof req.body === 'object') {
+    (req as any)._body = true;
+  }
+  next();
+});
+
 // Security: JSON body parser with size limiter to prevent DoS
 app.use(express.json({ limit: '1mb' }));
+
+// Security & CORS: Allow cross-origin preflights and standard headers for serverless/Vercel environments
+app.use((req: Request, res: Response, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
+
+// Create modular API Router to support both /api/* and rewritten paths on Vercel
+const apiRouter = express.Router();
 
 // Helper: Authoritative Firebase ID Token verification via Google Identity Toolkit
 async function verifyFirebaseIdToken(
@@ -363,7 +389,7 @@ async function generateContentWithRetry(
 }
 
 // Health check endpoint
-app.get('/api/health', (req: Request, res: Response) => {
+apiRouter.get('/health', (req: Request, res: Response) => {
   const isConfigured = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.API_KEY);
   res.json({
     status: 'healthy',
@@ -374,7 +400,7 @@ app.get('/api/health', (req: Request, res: Response) => {
 });
 
 // Safe security metadata endpoint (never leaks credentials)
-app.get('/api/security/info', (req: Request, res: Response) => {
+apiRouter.get('/security/info', (req: Request, res: Response) => {
   res.json({
     isolationLevel: 'strict-user-sandboxed',
     credentialStorage: 'server-side-isolated',
@@ -384,7 +410,7 @@ app.get('/api/security/info', (req: Request, res: Response) => {
 });
 
 // Chat endpoint for multi-turn empathetic journaling with smart memory & reminder detection
-app.post('/api/chat', async (req: Request, res: Response) => {
+apiRouter.post('/chat', async (req: Request, res: Response) => {
   try {
     const auth = await authenticateFirebaseRequest(req, res);
     if (!auth) return;
@@ -541,7 +567,7 @@ ${memoriesContext}
 });
 
 // Ask My Journal — Private Journal Intelligence & History Reasoning Endpoint
-app.post('/api/ask-journal', async (req: Request, res: Response) => {
+apiRouter.post('/ask-journal', async (req: Request, res: Response) => {
   try {
     const auth = await authenticateFirebaseRequest(req, res);
     if (!auth) return;
@@ -926,7 +952,7 @@ ${contextText}`;
 });
 
 // Summarization endpoint
-app.post('/api/summarize', async (req: Request, res: Response) => {
+apiRouter.post('/summarize', async (req: Request, res: Response) => {
   try {
     const auth = await authenticateFirebaseRequest(req, res);
     if (!auth) return;
@@ -1018,7 +1044,7 @@ Produce a structured, deeply insightful summary following the schema.`;
 });
 
 // Daily Mindful Reflection Prompt Generator
-app.get('/api/daily-prompt', async (req: Request, res: Response) => {
+apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
   try {
     const ai = getGeminiClient();
     const prompt = 'Generate 3 unique, inspiring, and calming daily journal reflection prompts for personal growth, mindfulness, and clarity.';
@@ -1083,9 +1109,14 @@ app.get('/api/daily-prompt', async (req: Request, res: Response) => {
   }
 });
 
-// Start Express server and connect Vite
+// Mount API router under both /api and / to seamlessly support direct calls and Vercel path rewrites
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
+
+// Start Express server and connect Vite in standalone non-serverless mode
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1104,4 +1135,20 @@ async function startServer() {
   });
 }
 
-startServer();
+export default app;
+
+// Only bind and listen when running directly as the main server process (not in Vercel serverless compute or imported as a function module)
+const isMainScript = Boolean(
+  process.argv[1] &&
+  (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.cjs') || process.argv[1].endsWith('server.js'))
+);
+
+const isServerless = Boolean(
+  process.env.VERCEL ||
+  process.env.NOW_REGION ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME
+);
+
+if (isMainScript && !isServerless) {
+  startServer();
+}
