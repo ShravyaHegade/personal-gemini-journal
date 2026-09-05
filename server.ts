@@ -402,7 +402,8 @@ async function generateContentWithRetry(
 // Minimal health check endpoint: safe, fast, executes without authentication or external calls
 apiRouter.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
-    status: 'healthy'
+    status: 'healthy',
+    runtime: 'vercel'
   });
 });
 
@@ -1145,13 +1146,15 @@ apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
 // Direct minimal health routes on app instance for direct unauthenticated ping
 app.get('/api/health', (req: Request, res: Response) => {
   res.status(200).json({
-    status: 'healthy'
+    status: 'healthy',
+    runtime: 'vercel'
   });
 });
 
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
-    status: 'healthy'
+    status: 'healthy',
+    runtime: 'vercel'
   });
 });
 
@@ -1170,6 +1173,18 @@ app.use((err: any, req: Request, res: Response, next: any) => {
 
 // Start Express server and connect Vite in standalone non-serverless mode
 async function startServer() {
+  if (
+    process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.NOW_REGION ||
+    process.env.AWS_REGION ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT ||
+    process.env.IS_SERVERLESS
+  ) {
+    return;
+  }
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -1190,30 +1205,48 @@ async function startServer() {
   });
 }
 
+export { app };
 export default app;
 
-// Only bind and listen when running directly as the main standalone server process
-// Explicitly NEVER bind/listen when imported in Vercel serverless functions or test suites
-const isServerless = Boolean(
-  process.env.VERCEL ||
-  process.env.VERCEL_ENV ||
-  process.env.NOW_REGION ||
-  process.env.AWS_REGION ||
-  process.env.AWS_LAMBDA_FUNCTION_NAME ||
-  process.env.LAMBDA_TASK_ROOT ||
-  process.env.IS_SERVERLESS
-);
+// Only bind and listen when running directly as the standalone server entrypoint
+function isRunningStandalone(): boolean {
+  if (
+    process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.NOW_REGION ||
+    process.env.AWS_REGION ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT ||
+    process.env.IS_SERVERLESS ||
+    process.env.NODE_ENV === 'test'
+  ) {
+    return false;
+  }
 
-const isMainScript = !isServerless && typeof process !== 'undefined' && Array.isArray(process.argv) && Boolean(
-  process.argv[1] &&
-  !process.argv[1].includes('api') &&
-  !process.argv[1].includes('node_modules') &&
-  (
-    process.argv[1].endsWith('server.ts') ||
-    process.argv[1].endsWith('server.cjs')
-  )
-);
+  if (typeof process === 'undefined' || !Array.isArray(process.argv) || !process.argv[1]) {
+    return false;
+  }
 
-if (isMainScript && process.env.NODE_ENV !== 'test') {
-  startServer();
+  const script = process.argv[1].replace(/\\/g, '/');
+  if (
+    script.includes('/api/') ||
+    script.endsWith('/api') ||
+    script.includes('.func') ||
+    script.includes('node_modules')
+  ) {
+    return false;
+  }
+
+  return (
+    script.endsWith('/server.ts') ||
+    script.endsWith('/server.cjs') ||
+    script === 'server.ts' ||
+    script === 'server.cjs'
+  );
+}
+
+if (isRunningStandalone()) {
+  startServer().catch((err) => {
+    console.error('Failed to start standalone server:', err?.message || err);
+  });
 }

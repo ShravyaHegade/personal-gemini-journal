@@ -1,6 +1,5 @@
-console.log('[api] module loading');
-
 import type { Request, Response } from 'express';
+import app from '../server.ts';
 
 export const config = {
   maxDuration: 60
@@ -77,41 +76,12 @@ function resolvePath(req: Request): string {
   return rawUrl;
 }
 
-let expressApp: any = null;
-let expressAppPromise: Promise<any> | null = null;
-
-/**
- * Safely lazy-loads the Express application.
- * If import or initialization fails, logs a safe diagnostic and does not crash the serverless container.
- */
-async function getExpressApp() {
-  if (expressApp) return expressApp;
-  if (!expressAppPromise) {
-    expressAppPromise = (async () => {
-      try {
-        const mod = await import('../server.ts');
-        const loadedApp = mod.default || mod;
-        console.log('[api] express app loaded');
-        expressApp = loadedApp;
-        return expressApp;
-      } catch (err: any) {
-        console.error('[api] express app load failed:', err?.message || 'Initialization error');
-        expressAppPromise = null;
-        throw err;
-      }
-    })();
-  }
-  return expressAppPromise;
-}
-
-export default async function handler(req: Request, res: Response) {
-  console.log('[api] handler invoked');
-
+export default function handler(req: Request, res: Response) {
   try {
     const resolvedPath = resolvePath(req);
     req.url = resolvedPath;
 
-    // 1. Minimal health check: handled immediately without requiring Express, Gemini, or Firebase
+    // 1. Minimal health check: handled immediately without external calls
     if (
       req.method === 'GET' &&
       (
@@ -122,7 +92,8 @@ export default async function handler(req: Request, res: Response) {
       )
     ) {
       return sendJson(res, 200, {
-        status: 'healthy'
+        status: 'healthy',
+        runtime: 'vercel'
       });
     }
 
@@ -136,53 +107,10 @@ export default async function handler(req: Request, res: Response) {
       (req as any)._body = true;
     }
 
-    // 3. Load Express application safely
-    let app: any;
-    try {
-      app = await getExpressApp();
-    } catch (importErr: any) {
-      console.error('[api] dispatch aborted due to app load failure');
-      if (!res.headersSent) {
-        return sendJson(res, 500, {
-          error: 'Internal Server Error: Application initialization failed'
-        });
-      }
-      return;
-    }
-
-    // 4. Dispatch request to Express app and cleanly await response lifecycle
-    return new Promise<void>((resolve) => {
-      if (res.headersSent) {
-        return resolve();
-      }
-
-      res.on('finish', resolve);
-      res.on('close', resolve);
-
-      try {
-        app(req, res, (err: any) => {
-          if (err) {
-            console.error('[api] express dispatch error:', err?.message || 'Route error');
-            if (!res.headersSent) {
-              sendJson(res, 500, {
-                error: 'Internal Server Error'
-              });
-            }
-          }
-          resolve();
-        });
-      } catch (dispatchErr: any) {
-        console.error('[api] synchronous dispatch error:', dispatchErr?.message || 'Dispatch error');
-        if (!res.headersSent) {
-          sendJson(res, 500, {
-            error: 'Internal Server Error'
-          });
-        }
-        resolve();
-      }
-    });
+    // 3. Dispatch to Express application
+    return app(req, res);
   } catch (err: any) {
-    console.error('[api] handler execution error:', err?.message || 'Unhandled invocation error');
+    console.error('[Vercel API] initialization failed:', err?.message || 'Dispatch error');
     if (!res.headersSent) {
       sendJson(res, 500, {
         error: 'Internal Server Error'
