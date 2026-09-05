@@ -1,28 +1,14 @@
-// Set serverless environment markers before importing server
-process.env.IS_SERVERLESS = 'true';
-if (!process.env.VERCEL) {
-  process.env.VERCEL = '1';
-}
+console.log('[api] module loading');
 
 import type { Request, Response } from 'express';
-import app from '../server.ts';
 
 export const config = {
   maxDuration: 60
 };
 
-// Safe startup diagnostic without exposing secrets
-try {
-  if (!app) {
-    console.error('Vercel API initialization failed at app load');
-  }
-} catch {
-  console.error('Vercel API initialization failed at module startup');
-}
-
 /**
- * Universal safe JSON sender that works on both raw Node.js ServerResponse
- * and Express-decorated Response objects.
+ * Universal safe JSON sender that works reliably on both raw Node.js ServerResponse
+ * and Express-decorated Response objects without throwing or exposing internals.
  */
 function sendJson(res: any, statusCode: number, data: any) {
   try {
@@ -43,10 +29,8 @@ function sendJson(res: any, statusCode: number, data: any) {
 
 /**
  * Cleanly resolves the incoming route path from headers, query params, or URL.
- * Never corrupts or depends on fragile query string reconstruction.
  */
 function resolvePath(req: Request): string {
-  // 1. Check standard Vercel rewrite headers where original path is preserved
   const originalHeaderPath = (
     req.headers['x-matched-path'] ||
     req.headers['x-invoke-path'] ||
@@ -66,12 +50,10 @@ function resolvePath(req: Request): string {
 
   const rawUrl = req.url || '/';
 
-  // 2. Check if already a clean /api/* path
   if (rawUrl.startsWith('/api/')) {
     return rawUrl;
   }
 
-  // 3. Check query params for endpoint if present
   try {
     const parsed = new URL(rawUrl, 'http://localhost');
     const endpoint = parsed.searchParams.get('endpoint') || parsed.searchParams.get('1');
@@ -95,41 +77,115 @@ function resolvePath(req: Request): string {
   return rawUrl;
 }
 
-export default function handler(req: Request, res: Response) {
+let expressApp: any = null;
+let expressAppPromise: Promise<any> | null = null;
+
+/**
+ * Safely lazy-loads the Express application.
+ * If import or initialization fails, logs a safe diagnostic and does not crash the serverless container.
+ */
+async function getExpressApp() {
+  if (expressApp) return expressApp;
+  if (!expressAppPromise) {
+    expressAppPromise = (async () => {
+      try {
+        const mod = await import('../server.ts');
+        const loadedApp = mod.default || mod;
+        console.log('[api] express app loaded');
+        expressApp = loadedApp;
+        return expressApp;
+      } catch (err: any) {
+        console.error('[api] express app load failed:', err?.message || 'Initialization error');
+        expressAppPromise = null;
+        throw err;
+      }
+    })();
+  }
+  return expressAppPromise;
+}
+
+export default async function handler(req: Request, res: Response) {
+  console.log('[api] handler invoked');
+
   try {
     const resolvedPath = resolvePath(req);
     req.url = resolvedPath;
 
-    // 1. Direct unauthenticated minimal health check
+    // 1. Minimal health check: handled immediately without requiring Express, Gemini, or Firebase
     if (
       req.method === 'GET' &&
-      (resolvedPath === '/api/health' || resolvedPath === '/health' || resolvedPath.startsWith('/api/health?') || resolvedPath.startsWith('/health?'))
+      (
+        resolvedPath === '/api/health' ||
+        resolvedPath === '/health' ||
+        resolvedPath.startsWith('/api/health?') ||
+        resolvedPath.startsWith('/health?')
+      )
     ) {
       return sendJson(res, 200, {
-        status: 'healthy',
-        runtime: 'vercel'
+        status: 'healthy'
       });
     }
 
-    // 2. Normalize potential pre-parsed body from Vercel
+    // 2. Normalize pre-parsed body from Vercel if needed
     if ((req as any).body !== undefined && (req as any).body !== null) {
       if (typeof (req as any).body === 'string' && (req as any).body.trim().startsWith('{')) {
         try {
           (req as any).body = JSON.parse((req as any).body);
-        } catch {
-          // Keep raw string
-        }
+        } catch {}
       }
       (req as any)._body = true;
     }
 
-    // 3. Dispatch to Express application directly without a premature Promise wrapper
-    return app(req, res);
+    // 3. Load Express application safely
+    let app: any;
+    try {
+      app = await getExpressApp();
+    } catch (importErr: any) {
+      console.error('[api] dispatch aborted due to app load failure');
+      if (!res.headersSent) {
+        return sendJson(res, 500, {
+          error: 'Internal Server Error: Application initialization failed'
+        });
+      }
+      return;
+    }
+
+    // 4. Dispatch request to Express app and cleanly await response lifecycle
+    return new Promise<void>((resolve) => {
+      if (res.headersSent) {
+        return resolve();
+      }
+
+      res.on('finish', resolve);
+      res.on('close', resolve);
+
+      try {
+        app(req, res, (err: any) => {
+          if (err) {
+            console.error('[api] express dispatch error:', err?.message || 'Route error');
+            if (!res.headersSent) {
+              sendJson(res, 500, {
+                error: 'Internal Server Error'
+              });
+            }
+          }
+          resolve();
+        });
+      } catch (dispatchErr: any) {
+        console.error('[api] synchronous dispatch error:', dispatchErr?.message || 'Dispatch error');
+        if (!res.headersSent) {
+          sendJson(res, 500, {
+            error: 'Internal Server Error'
+          });
+        }
+        resolve();
+      }
+    });
   } catch (err: any) {
-    console.error('Vercel API initialization failed at request dispatch');
+    console.error('[api] handler execution error:', err?.message || 'Unhandled invocation error');
     if (!res.headersSent) {
       sendJson(res, 500, {
-        error: 'Serverless invocation dispatch error'
+        error: 'Internal Server Error'
       });
     }
   }

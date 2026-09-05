@@ -1,7 +1,9 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type, Schema } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
+import type { Schema } from '@google/genai';
 
 try {
   dotenv.config();
@@ -19,16 +21,14 @@ const DEFAULT_FIREBASE_CONFIG = {
 function getFirebaseConfig(): {
   projectId: string;
   apiKey: string;
-  firestoreDatabaseId?: string;
+  firestoreDatabaseId: string;
 } {
   return {
     projectId: process.env.FIREBASE_PROJECT_ID || DEFAULT_FIREBASE_CONFIG.projectId,
     apiKey: process.env.FIREBASE_API_KEY || DEFAULT_FIREBASE_CONFIG.apiKey,
-    firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || DEFAULT_FIREBASE_CONFIG.firestoreDatabaseId
+    firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || DEFAULT_FIREBASE_CONFIG.firestoreDatabaseId || '(default)'
   };
 }
-
-const firebaseConfig = getFirebaseConfig();
 
 const app = express();
 const PORT = 3000;
@@ -152,10 +152,11 @@ async function authenticateFirebaseRequest(
   }
 
   try {
+    const fbConfig = getFirebaseConfig();
     const verified = await verifyFirebaseIdToken(
       idToken,
-      firebaseConfig.projectId,
-      firebaseConfig.apiKey
+      fbConfig.projectId,
+      fbConfig.apiKey
     );
 
     if (!verified || !verified.uid) {
@@ -226,8 +227,9 @@ async function fetchUserCollection(
   collectionName: string,
   limitCount: number = 100
 ): Promise<any[]> {
-  const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${databaseId}/documents/users/${verifiedUid}:runQuery`;
+  const fbConfig = getFirebaseConfig();
+  const databaseId = fbConfig.firestoreDatabaseId;
+  const url = `https://firestore.googleapis.com/v1/projects/${fbConfig.projectId}/databases/${databaseId}/documents/users/${verifiedUid}:runQuery`;
 
   try {
     const res = await fetch(url, {
@@ -272,8 +274,9 @@ async function fetchConversationMessages(
   conversationId: string,
   limitCount: number = 100
 ): Promise<any[]> {
-  const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${databaseId}/documents/users/${verifiedUid}/conversations/${conversationId}:runQuery`;
+  const fbConfig = getFirebaseConfig();
+  const databaseId = fbConfig.firestoreDatabaseId;
+  const url = `https://firestore.googleapis.com/v1/projects/${fbConfig.projectId}/databases/${databaseId}/documents/users/${verifiedUid}/conversations/${conversationId}:runQuery`;
 
   try {
     const res = await fetch(url, {
@@ -399,8 +402,7 @@ async function generateContentWithRetry(
 // Minimal health check endpoint: safe, fast, executes without authentication or external calls
 apiRouter.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
-    status: 'healthy',
-    runtime: process.env.VERCEL ? 'vercel' : 'node'
+    status: 'healthy'
   });
 });
 
@@ -1143,15 +1145,13 @@ apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
 // Direct minimal health routes on app instance for direct unauthenticated ping
 app.get('/api/health', (req: Request, res: Response) => {
   res.status(200).json({
-    status: 'healthy',
-    runtime: process.env.VERCEL ? 'vercel' : 'node'
+    status: 'healthy'
   });
 });
 
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
-    status: 'healthy',
-    runtime: process.env.VERCEL ? 'vercel' : 'node'
+    status: 'healthy'
   });
 });
 
@@ -1198,22 +1198,22 @@ const isServerless = Boolean(
   process.env.VERCEL ||
   process.env.VERCEL_ENV ||
   process.env.NOW_REGION ||
+  process.env.AWS_REGION ||
   process.env.AWS_LAMBDA_FUNCTION_NAME ||
   process.env.LAMBDA_TASK_ROOT ||
   process.env.IS_SERVERLESS
 );
 
-const isMainScript = typeof process !== 'undefined' && Array.isArray(process.argv) && Boolean(
+const isMainScript = !isServerless && typeof process !== 'undefined' && Array.isArray(process.argv) && Boolean(
   process.argv[1] &&
-  !process.argv[1].includes('api/index') &&
-  !process.argv[1].includes('api\\index') &&
+  !process.argv[1].includes('api') &&
+  !process.argv[1].includes('node_modules') &&
   (
     process.argv[1].endsWith('server.ts') ||
-    process.argv[1].endsWith('server.cjs') ||
-    process.argv[1].endsWith('server.js')
+    process.argv[1].endsWith('server.cjs')
   )
 );
 
-if (isMainScript && !isServerless && process.env.NODE_ENV !== 'test') {
+if (isMainScript && process.env.NODE_ENV !== 'test') {
   startServer();
 }
