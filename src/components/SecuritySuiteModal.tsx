@@ -72,7 +72,7 @@ export const SecuritySuiteModal: React.FC<SecuritySuiteModalProps> = ({ isOpen, 
       id: 'test-secret-exposure',
       name: '5. Zero Client Secret Exposure Check',
       category: 'Secret Protection',
-      description: 'Audits frontend bundle, window globals, and import.meta.env to ensure GEMINI_API_KEY is isolated server-side.',
+      description: 'Audits frontend bundle, window globals, storage, and client environment to ensure AI credentials are strictly isolated server-side.',
       status: 'idle',
       log: 'Awaiting test execution.'
     },
@@ -191,28 +191,52 @@ export const SecuritySuiteModal: React.FC<SecuritySuiteModalProps> = ({ isOpen, 
       }
 
       else if (testId === 'test-secret-exposure') {
-        // Inspect browser environment
+        // Dynamic audit of client environment, window globals, and local storage
         const clientEnv = (import.meta as any).env || {};
-        const hasLeakedKey = Boolean(
-          clientEnv.GEMINI_API_KEY ||
-          clientEnv.VITE_GEMINI_API_KEY ||
-          (window as any).GEMINI_API_KEY ||
-          (window as any).process?.env?.GEMINI_API_KEY
-        );
+        const envKeys = Object.keys(clientEnv);
+        const leakedEnvKey = envKeys.find(k => {
+          const upper = k.toUpperCase();
+          return upper.includes('GEMINI') || upper.includes('GOOGLE_AI') || (upper.includes('API_KEY') && !upper.includes('FIREBASE'));
+        });
+
+        const win = typeof window !== 'undefined' ? (window as any) : {};
+        const windowKeys = Object.keys(win);
+        const leakedWindowKey = windowKeys.find(k => {
+          const upper = k.toUpperCase();
+          return upper.includes('GEMINI') || upper.includes('GOOGLE_AI');
+        });
+
+        let leakedStorageKey = '';
+        try {
+          if (typeof localStorage !== 'undefined') {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = (localStorage.key(i) || '').toUpperCase();
+              if (k.includes('GEMINI') || k.includes('GOOGLE_AI')) {
+                leakedStorageKey = k;
+                break;
+              }
+            }
+          }
+        } catch {
+          // Ignore storage access issues in restricted iframes
+        }
+
+        const hasAiSdkOnWindow = Boolean(win.GoogleGenAI || win.genai);
+        const leakFound = leakedEnvKey || leakedWindowKey || leakedStorageKey || (hasAiSdkOnWindow ? 'GoogleGenAI SDK on window' : null);
 
         const elapsed = Math.round(performance.now() - startTime);
-        if (!hasLeakedKey) {
+        if (!leakFound) {
           setTests(prev => prev.map(t => t.id === testId ? {
             ...t,
             status: 'passed',
             executionTime: elapsed,
-            log: `[AUDIT PASSED]: Scanned window, client env variables, and localStorage. 0 Gemini API secret references found in frontend bundle. Gemini operates exclusively via server-side API proxy.`
+            log: `[AUDIT PASSED]: Scanned window globals, client environment variables, and local storage. 0 AI secret references found in frontend scope. Gemini operates exclusively via server-side API proxy.`
           } : t));
         } else {
           setTests(prev => prev.map(t => t.id === testId ? {
             ...t,
             status: 'failed',
-            log: `LEAK DETECTED: GEMINI_API_KEY found in frontend scope!`
+            log: `LEAK DETECTED: ${leakFound} found in frontend scope!`
           } : t));
         }
       }

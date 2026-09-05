@@ -5,11 +5,16 @@ coverage/
 .DS_Store
 *.log
 
-# Environment files
+# Environment and secrets files
 .env
 .env.local
+.env.development
+.env.test
+.env.production
 .env.*
 !.env.example
+*.secrets
+secrets.json
 
 # Local credentials and service account files
 *credentials*.json

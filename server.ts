@@ -1,6 +1,7 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import path from 'path';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { Schema } from '@google/genai';
@@ -11,22 +12,25 @@ try {
   // Ignore dotenv failures in environments where .env is not present
 }
 
-// Fallback Firebase configuration to avoid any filesystem or ESM JSON import issues in serverless compute
-const DEFAULT_FIREBASE_CONFIG = {
-  projectId: 'personal-gemini-journal-507109',
-  apiKey: 'AIzaSyA29RkIjkb5IlvVXkxcczk2Ll25bU92740',
-  firestoreDatabaseId: 'ai-studio-697eeba7-4692-4030-aac5-8d1022e8a45e'
-};
-
 function getFirebaseConfig(): {
   projectId: string;
   apiKey: string;
   firestoreDatabaseId: string;
 } {
+  let fileConfig: { projectId?: string; apiKey?: string; firestoreDatabaseId?: string } = {};
+  try {
+    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    }
+  } catch {
+    // Ignore filesystem read errors in restricted serverless environments
+  }
+
   return {
-    projectId: process.env.FIREBASE_PROJECT_ID || DEFAULT_FIREBASE_CONFIG.projectId,
-    apiKey: process.env.FIREBASE_API_KEY || DEFAULT_FIREBASE_CONFIG.apiKey,
-    firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || DEFAULT_FIREBASE_CONFIG.firestoreDatabaseId || '(default)'
+    projectId: process.env.FIREBASE_PROJECT_ID || fileConfig.projectId || '',
+    apiKey: process.env.FIREBASE_API_KEY || fileConfig.apiKey || '',
+    firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || fileConfig.firestoreDatabaseId || '(default)'
   };
 }
 
@@ -437,7 +441,7 @@ apiRouter.post('/chat', async (req: Request, res: Response) => {
     const { ai, hasKey } = getGeminiClient();
     if (!hasKey) {
       return res.status(503).json({
-        error: 'Gemini API key is not configured on the server. Please configure GEMINI_API_KEY in your environment variables.'
+        error: 'AI service is currently unavailable on the server. Please verify server environment configuration.'
       });
     }
 
@@ -602,7 +606,7 @@ apiRouter.post('/ask-journal', async (req: Request, res: Response) => {
     const { ai, hasKey } = getGeminiClient();
     if (!hasKey) {
       return res.status(503).json({
-        error: 'Gemini API key is not configured on the server. Please configure GEMINI_API_KEY in your environment variables.'
+        error: 'AI service is currently unavailable on the server. Please verify server environment configuration.'
       });
     }
 
@@ -991,7 +995,7 @@ apiRouter.post('/summarize', async (req: Request, res: Response) => {
     const { ai, hasKey } = getGeminiClient();
     if (!hasKey) {
       return res.status(503).json({
-        error: 'Gemini API key is not configured on the server. Please configure GEMINI_API_KEY in your environment variables.'
+        error: 'AI service is currently unavailable on the server. Please verify server environment configuration.'
       });
     }
 
