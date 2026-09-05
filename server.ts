@@ -1,37 +1,34 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-import fallbackFirebaseConfig from './firebase-applet-config.json';
 
-dotenv.config();
+try {
+  dotenv.config();
+} catch {
+  // Ignore dotenv failures in environments where .env is not present
+}
 
-// Load Firebase configuration securely for token verification and Firestore REST operations
-let firebaseConfig: {
+// Fallback Firebase configuration to avoid any filesystem or ESM JSON import issues in serverless compute
+const DEFAULT_FIREBASE_CONFIG = {
+  projectId: 'personal-gemini-journal-507109',
+  apiKey: 'AIzaSyA29RkIjkb5IlvVXkxcczk2Ll25bU92740',
+  firestoreDatabaseId: 'ai-studio-697eeba7-4692-4030-aac5-8d1022e8a45e'
+};
+
+function getFirebaseConfig(): {
   projectId: string;
   apiKey: string;
   firestoreDatabaseId?: string;
-} = {
-  projectId: fallbackFirebaseConfig.projectId || 'personal-gemini-journal-507109',
-  apiKey: fallbackFirebaseConfig.apiKey || 'AIzaSyA29RkIjkb5IlvVXkxcczk2Ll25bU92740',
-  firestoreDatabaseId: fallbackFirebaseConfig.firestoreDatabaseId || 'ai-studio-697eeba7-4692-4030-aac5-8d1022e8a45e'
-};
-
-try {
-  const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-  if (fs.existsSync(configPath)) {
-    const rawConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    firebaseConfig = { ...firebaseConfig, ...rawConfig };
-  }
-} catch (e) {
-  console.warn('Note: using fallback Firebase configuration:', e);
+} {
+  return {
+    projectId: process.env.FIREBASE_PROJECT_ID || DEFAULT_FIREBASE_CONFIG.projectId,
+    apiKey: process.env.FIREBASE_API_KEY || DEFAULT_FIREBASE_CONFIG.apiKey,
+    firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || DEFAULT_FIREBASE_CONFIG.firestoreDatabaseId
+  };
 }
 
-// Allow environment variable overrides (e.g. on Vercel deployment)
-if (process.env.FIREBASE_PROJECT_ID) firebaseConfig.projectId = process.env.FIREBASE_PROJECT_ID;
-if (process.env.FIREBASE_API_KEY) firebaseConfig.apiKey = process.env.FIREBASE_API_KEY;
-if (process.env.FIRESTORE_DATABASE_ID) firebaseConfig.firestoreDatabaseId = process.env.FIRESTORE_DATABASE_ID;
+const firebaseConfig = getFirebaseConfig();
 
 const app = express();
 const PORT = 3000;
@@ -399,14 +396,11 @@ async function generateContentWithRetry(
   throw lastError || new Error('All Gemini model endpoints were unavailable');
 }
 
-// Health check endpoint
+// Minimal health check endpoint: safe, fast, executes without authentication or external calls
 apiRouter.get('/health', (req: Request, res: Response) => {
-  const isConfigured = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.API_KEY);
-  res.json({
+  res.status(200).json({
     status: 'healthy',
-    timestamp: new Date().toISOString(),
-    service: 'Personal Gemini Journal Backend',
-    geminiConfigured: isConfigured
+    runtime: process.env.VERCEL ? 'vercel' : 'node'
   });
 });
 
@@ -1146,13 +1140,28 @@ apiRouter.get('/daily-prompt', async (req: Request, res: Response) => {
   }
 });
 
+// Direct minimal health routes on app instance for direct unauthenticated ping
+app.get('/api/health', (req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'healthy',
+    runtime: process.env.VERCEL ? 'vercel' : 'node'
+  });
+});
+
+app.get('/health', (req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'healthy',
+    runtime: process.env.VERCEL ? 'vercel' : 'node'
+  });
+});
+
 // Mount API router under both /api and / to seamlessly support direct calls and Vercel path rewrites
 app.use('/api', apiRouter);
 app.use('/', apiRouter);
 
 // Express unhandled error handler: Always return JSON instead of default HTML error page
 app.use((err: any, req: Request, res: Response, next: any) => {
-  console.error('Unhandled Express error:', err);
+  console.error('Unhandled Express error:', err?.message || 'Internal error');
   if (res.headersSent) return next(err);
   res.status(500).json({
     error: err?.message || 'An internal server error occurred.'
@@ -1183,18 +1192,28 @@ async function startServer() {
 
 export default app;
 
-// Only bind and listen when running directly as the main server process (not in Vercel serverless compute or imported as a function module)
-const isMainScript = Boolean(
-  process.argv[1] &&
-  (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.cjs') || process.argv[1].endsWith('server.js'))
-);
-
+// Only bind and listen when running directly as the main standalone server process
+// Explicitly NEVER bind/listen when imported in Vercel serverless functions or test suites
 const isServerless = Boolean(
   process.env.VERCEL ||
+  process.env.VERCEL_ENV ||
   process.env.NOW_REGION ||
-  process.env.AWS_LAMBDA_FUNCTION_NAME
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  process.env.LAMBDA_TASK_ROOT ||
+  process.env.IS_SERVERLESS
 );
 
-if (isMainScript && !isServerless) {
+const isMainScript = typeof process !== 'undefined' && Array.isArray(process.argv) && Boolean(
+  process.argv[1] &&
+  !process.argv[1].includes('api/index') &&
+  !process.argv[1].includes('api\\index') &&
+  (
+    process.argv[1].endsWith('server.ts') ||
+    process.argv[1].endsWith('server.cjs') ||
+    process.argv[1].endsWith('server.js')
+  )
+);
+
+if (isMainScript && !isServerless && process.env.NODE_ENV !== 'test') {
   startServer();
 }
